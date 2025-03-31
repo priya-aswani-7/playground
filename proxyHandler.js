@@ -1,11 +1,6 @@
-const { chromium } = require('playwright');
-const fs = require('fs');
-const path = require('path');
-const cors = require('@koa/cors');
+const proxy = require('koa-proxies');
 const URL = require('url').URL;
-const axios = require('axios');
-const os = require('os');
-const logger = require('koa-morgan'); // Koa-compatible morgan logger
+const cors = require('@koa/cors');
 
 const validateUrl = (url) => {
   try {
@@ -16,46 +11,7 @@ const validateUrl = (url) => {
   }
 };
 
-let browser;
-
-const startBrowser = async () => {
-  if (!browser) {
-    browser = await chromium.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-web-security'],
-      ignoreHTTPSErrors: true,
-    });
-
-    process.on('exit', async () => {
-      if (browser) await browser.close();
-    });
-  }
-  return browser;
-};
-
-// Utility function to download assets (JS, CSS, Images)
-const downloadAsset = async (assetUrl, baseUrl) => {
-  const fileUrl = new URL(assetUrl, baseUrl);
-  const filePath = path.join(os.tmpdir(), path.basename(fileUrl.pathname)); // Save in system's temp directory
-
-  // Check if the file exists, if not download it
-  if (!fs.existsSync(filePath)) {
-    const response = await axios.get(fileUrl.href, { responseType: 'arraybuffer' });
-    fs.writeFileSync(filePath, response.data);
-  }
-
-  return filePath;
-};
-
-// Rewrite asset URLs in the HTML content
-const rewriteUrlsInContent = (content, baseUrl) => {
-  return content.replace(/(["' ])(\/[^"'>]+)/g, (match, quote, relativeUrl) => {
-    // Convert relative URLs to the local server path (e.g., replace with local paths)
-    return `${quote}${baseUrl}${relativeUrl}`;
-  });
-};
-
-const handler = async (ctx) => {
+const handler = async (ctx, next) => {
   if (ctx.method !== 'GET') {
     ctx.status = 405;
     ctx.body = { status: 'error', message: 'Only GET requests are allowed.' };
@@ -63,6 +19,7 @@ const handler = async (ctx) => {
   }
 
   const targetUrl = ctx.query.url;
+
   if (!targetUrl || !validateUrl(targetUrl)) {
     ctx.status = 400;
     ctx.body = { status: 'error', message: 'Invalid URL.' };
@@ -71,73 +28,131 @@ const handler = async (ctx) => {
 
   const targetUrlObj = new URL(targetUrl);
   const baseUrl = `${targetUrlObj.protocol}//${targetUrlObj.host}`;
+  const path = targetUrlObj.pathname + targetUrlObj.search;
 
   try {
-    // ✅ Fix CORS issues
-    ctx.set('Access-Control-Allow-Origin', '*');
-    ctx.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    ctx.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-    ctx.set('Access-Control-Allow-Credentials', 'true');
+    return proxy('/', {
+      target: baseUrl,
+      changeOrigin: true,
+      logs: true,
+      secure: false,
+      followRedirects: true,
+      timeout: 30000,
+      ws: true,
 
-    // ✅ Remove restrictive security headers
-    const securityHeaders = [
-      'x-frame-options',
-      'content-security-policy',
-      'permissions-policy',
-      'strict-transport-security',
-      'x-content-type-options',
-      'feature-policy',
-      'referrer-policy',
-    ];
+      rewrite: (originalPath) => {
+        return originalPath === '/' ? path || '/' : originalPath;
+      },
 
-    securityHeaders.forEach(header => ctx.set(header, ''));
+      async onProxyReq(proxyReq, ctx) {
+        proxyReq.setHeader('Accept-Encoding', 'gzip, deflate, br');
+        proxyReq.setHeader(
+          'User-Agent',
+          ctx.get('User-Agent') || 'Mozilla/5.0',
+        );
+        proxyReq.setHeader('Referer', baseUrl);
+        proxyReq.setHeader('Accept', '*/*');
+      },
 
-    // Start the browser and fetch page content
-    const browser = await startBrowser();
-    const page = await browser.newPage();
+      async onProxyRes(proxyRes, ctx) {
+        if (!proxyRes || !proxyRes.headers) {
+          ctx.status = 502;
+          ctx.body = {
+            status: 'error',
+            message: 'Bad Gateway - No response from target.',
+          };
+          return;
+        }
 
-    await page.setExtraHTTPHeaders({
-      'Accept-Encoding': 'gzip, deflate, br',
-      'User-Agent':
-        ctx.get('User-Agent') ||
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      Referer: baseUrl,
-      Accept: '*/*',
-      Origin: baseUrl,
-    });
+        // Set permissive CORS headers to allow cross-origin requests
+        ctx.set('Access-Control-Allow-Origin', '*');
+        ctx.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS, POST');
+        ctx.set(
+          'Access-Control-Allow-Headers',
+          'Content-Type, Authorization, X-Requested-With',
+        );
+        ctx.set('Access-Control-Allow-Credentials', 'true');
 
-    // ✅ Download the page content
-    await page.goto(targetUrl, { waitUntil: 'load', timeout: 30000 });
-    await page.waitForSelector('body', { timeout: 10000 });
+        // Remove security headers that would prevent iframe loading or script execution
+        [
+          'x-frame-options',
+          'content-security-policy',
+          'permissions-policy',
+          'strict-transport-security',
+          'x-content-type-options',
+          'feature-policy',
+          'referrer-policy',
+        ].forEach((header) => {
+          if (proxyRes.headers[header]) {
+            delete proxyRes.headers[header];
+          }
+        });
 
-    // Get the HTML content
-    let content = await page.content();
+        // Add a very permissive Content Security Policy
+        ctx.set(
+          'Content-Security-Policy',
+          "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; " +
+            "script-src * 'unsafe-inline' 'unsafe-eval'; " +
+            "style-src * 'unsafe-inline'; " +
+            'img-src * data: blob:; ' +
+            'connect-src *; ' +
+            'frame-ancestors *;',
+        );
 
-    // ✅ Rewrite URLs for assets
-    content = await rewriteUrlsInContent(content, baseUrl);
+        const contentType = proxyRes.headers['content-type'] || '';
+        const path = ctx.request.path;
 
-    // Download assets (e.g., JS, CSS, images)
-    const assetUrls = [
-      ...new Set([...content.matchAll(/(["' ])(\/[^"'>]+)/g)].map(match => match[2]))
-    ];
+        // Handle different content types appropriately
+        if (path.match(/\.(png|jpg|jpeg|gif|webp|svg|ico)(\?.*)?$/i)) {
+          const extension = path.split('.').pop().split('?')[0].toLowerCase();
+          const mimeType =
+            {
+              png: 'image/png',
+              jpg: 'image/jpeg',
+              jpeg: 'image/jpeg',
+              gif: 'image/gif',
+              webp: 'image/webp',
+              svg: 'image/svg+xml',
+              ico: 'image/x-icon',
+            }[extension] || 'image/png';
 
-    const downloadedAssets = [];
+          ctx.set('Content-Type', mimeType);
+          ctx.set('Cache-Control', 'public, max-age=86400, immutable');
+        } else if (
+          contentType.includes('application/json') &&
+          path.endsWith('.js')
+        ) {
+          ctx.set('Content-Type', 'application/javascript; charset=utf-8');
+        } else if (contentType.includes('text/html')) {
+          ctx.set('Content-Type', 'text/html; charset=utf-8');
+        } else if (contentType.includes('text/css')) {
+          ctx.set('Content-Type', 'text/css; charset=utf-8');
+        } else if (
+          contentType.includes('application/javascript') ||
+          contentType.includes('text/javascript')
+        ) {
+          ctx.set('Content-Type', 'application/javascript; charset=utf-8');
+        }
+      },
 
-    for (let assetUrl of assetUrls) {
-      const localPath = await downloadAsset(assetUrl, baseUrl);
-      downloadedAssets.push({ assetUrl, localPath });
-    }
-
-    // Serve the content with asset links updated
-    content = await rewriteUrlsInContent(content, '/assets/'); // Rewriting the base URL to local '/assets/'
-
-    await page.close();
-    ctx.body = content;
-    ctx.status = 200;
+      onError: (err, ctx) => {
+        ctx.status = 500;
+        ctx.body = {
+          status: 'error',
+          message: 'Internal server error',
+          details: err.message,
+          path: ctx.request.path,
+        };
+      },
+    })(ctx, next);
   } catch (error) {
-    console.error('❌ Error fetching page:', error);
     ctx.status = 500;
-    ctx.body = { status: 'error', message: 'Failed to load page through proxy', details: error.message };
+    ctx.body = {
+      status: 'error',
+      message: 'Internal server error',
+      details: error.message,
+      path: ctx.request.path,
+    };
   }
 };
 
